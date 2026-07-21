@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hieron"
+version = "1.1.0"
+description = "Azure DevOps PR & commit diff fetcher — unified patches, tag comparison, SQLite cache; analysis-ready JSON for AI review."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "alex-vinny" }]
+keywords = ["azure-devops", "pull-request", "diff", "code-review", "cli"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/alex-vinny/hieron"
+Issues = "https://github.com/alex-vinny/hieron/issues"
+
+[project.scripts]
+hieron = "git_diff_analysis:main"
+
+[tool.setuptools]
+py-modules = ["git_diff_analysis"]
