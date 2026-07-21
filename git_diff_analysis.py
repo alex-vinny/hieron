@@ -12,7 +12,7 @@ Usage:
     python git_diff_analysis.py cache stats
     python git_diff_analysis.py cache clear [<url>]
 
-Config: reads ~/.azure-connector.json  (shared with azure-connector node tool)
+Config: reads ~/.azure-connector.json (a JSON file with "pat"/"org"/"baseUrl")
         or env vars: AZURE_PAT, AZURE_ORG, AZURE_BASE_URL
 """
 
@@ -25,7 +25,8 @@ import re
 import sqlite3
 import sys
 
-# Force UTF-8 output on Windows (pr titles / file names can contain non-ASCII / emoji)
+# Force UTF-8 stdout/stderr (PR titles / file names can contain non-ASCII / emoji;
+# some consoles default to a legacy code page). A no-op where UTF-8 is already set.
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 if hasattr(sys.stderr, 'reconfigure'):
@@ -843,7 +844,7 @@ Examples:
   # Clear cache for one PR or commit
   python git_diff_analysis.py cache clear <url>
 
-Config: ~/.azure-connector.json  (shared with azure-connector node tool)
+Config: ~/.azure-connector.json (a JSON file with "pat"/"org"/"baseUrl")
         or env vars AZURE_PAT, AZURE_ORG, AZURE_BASE_URL
         """
     )
@@ -908,7 +909,7 @@ Config: ~/.azure-connector.json  (shared with azure-connector node tool)
     if args.command == "tags":
         cfg = load_config()
         if not cfg["pat"]:
-            print("ERROR: Azure PAT not configured. Set AZURE_PAT env var or run: azure-connector config --pat <token>", file=sys.stderr)
+            print('ERROR: Azure PAT not configured. Set the AZURE_PAT env var, or add "pat" to ~/.azure-connector.json', file=sys.stderr)
             sys.exit(1)
         # URL form: `tags <repo-url> <oldTag> <newTag>` → repo arg is absent.
         if args.repo is None:
@@ -933,7 +934,7 @@ Config: ~/.azure-connector.json  (shared with azure-connector node tool)
             sys.stderr = open(os.devnull, 'w')
         cfg = load_config()
         if not cfg["pat"]:
-            print("ERROR: Azure PAT not configured. Set AZURE_PAT env var or run: azure-connector config --pat <token>", file=sys.stderr)
+            print('ERROR: Azure PAT not configured. Set the AZURE_PAT env var, or add "pat" to ~/.azure-connector.json', file=sys.stderr)
             sys.exit(1)
         db = get_db()
         results = []
@@ -961,7 +962,7 @@ Config: ~/.azure-connector.json  (shared with azure-connector node tool)
 
     cfg = load_config()
     if not cfg["pat"]:
-        print("ERROR: Azure PAT not configured. Set AZURE_PAT env var or run: azure-connector config --pat <token>", file=sys.stderr)
+        print('ERROR: Azure PAT not configured. Set the AZURE_PAT env var, or add "pat" to ~/.azure-connector.json', file=sys.stderr)
         sys.exit(1)
 
     db = get_db()

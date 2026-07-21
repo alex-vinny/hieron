@@ -25,8 +25,7 @@ Provide a PAT one of two ways:
 
 - Set `AZURE_PAT` (and optionally `AZURE_ORG`, `AZURE_BASE_URL`) in your shell, or
 - Write `~/.azure-connector.json` with `{ "pat": "...", "org": "...",
-  "baseUrl": "https://dev.azure.com" }`. This file is shared with the
-  `azure-connector` CLI, so if that is already configured Hieron needs nothing.
+  "baseUrl": "https://dev.azure.com" }` (only `pat` is required).
 
 The org is normally read from the PR/commit URL; only `tags` with a bare project
 name falls back to the configured org.
