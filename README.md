@@ -52,12 +52,14 @@ Re-run with `--force` after the author pushes a new iteration.
 | `tags <repo-url> <oldTag> <newTag>` | same, project/repo taken from the URL |
 | `cache stats` | show cache size and age |
 | `cache clear [<url>]` | clear the whole cache, or one PR/commit |
+| `check-tailwind <pr-url> --css <repo-path> \| --css-local <file> [--prefix tw-]` | are the arbitrary-value Tailwind classes the PR adds actually compiled? |
+| `check-resx <pr-url> --resx "<repo path with {locale}>" [--root <clone>] [--locales a,b,c] [--getter Engine.Get]` | does every resource key the PR adds exist in all localized `.resx` files? |
 
 Shared flags for `pr` / `commit`:
 
 | Flag | What |
 |---|---|
-| `--output json\|summary\|md\|lines` | output format (default `json`) |
+| `--output json\|summary\|md\|lines\|stats` | output format (default `json`) |
 | `--chunk N` | max lines per JSON patch chunk (default 300) |
 | `--force` | bypass the 30-minute cache and re-fetch |
 | `--quiet`, `-q` | suppress progress on stderr (also auto-off when stdout is redirected) |
@@ -66,6 +68,49 @@ Shared flags for `pr` / `commit`:
 new-file line numbers from the hunk headers — useful for pinpointing exact
 line numbers before posting inline PR comments. Because diffs are pinned to the
 iteration's source commit, those numbers match Azure's right-side anchor.
+
+`--output stats` breaks the **added** lines down into code / comment / blank per file,
+with a comment:code ratio and a total. Added-only is deliberate: a review judges what
+is being introduced, and counting whole files measures the codebase's history instead.
+Comment syntax is chosen by file extension (`//`, `#`, `--`, `<!-- -->`, `/* */`), and a
+multi-line block is tracked so only its first line is not counted as code. Treat the ratio
+as evidence, not a verdict.
+
+### The review checks
+
+Both read the PR's **added lines** — the same reconstruction `--output lines` uses — and both
+read the file they compare against **at the PR's head commit**, not from your working tree.
+A local clone answers a question about whichever branch happens to be checked out, so a key
+the PR does add can come back "missing". Pinning to the commit (not the branch name) also
+means a push mid-review cannot change the answer.
+
+A file that does not exist at the head commit is reported as such. Any other read failure
+(expired PAT, network) is an `ERROR` with exit code 2, never a "missing" finding.
+
+```bash
+# every arbitrary-value class the PR introduces, checked against the built CSS
+python git_diff_analysis.py check-tailwind <pr-url> --css web/static/css/tailwind.css
+```
+
+`--css` is a **repo path**, read at the PR head. Use `--css-local <file>` only when the CSS is
+built in CI and never committed — the output labels that mode `NOT the PR's tree`, because then
+a "missing" class may just mean a stale local build.
+
+Tailwind escapes brackets in the emitted selector (`.tw-text-\[10px\]`), so searching the CSS
+for the raw class name reports every arbitrary-value class as missing. Both forms are tried.
+
+```bash
+# every Engine.Get("...") key the PR introduces, checked in each locale
+python git_diff_analysis.py check-resx <pr-url> \
+  --resx "src/App/Resources/Strings.{locale}.resx" --locales pt-BR,en-US,es-ES
+```
+
+`--getter` names the accessor to scan for (default `Engine.Get`, matching `Engine.Get("Key")`);
+`--locales` defaults to `pt-BR,en-US,es-ES`.
+
+`--root <clone>` switches `check-resx` to a local tree. It then prints the clone's branch next
+to the PR head and **warns loudly when they differ**. Prefer the default. Exit code is 1 when
+something is missing and 2 when a file could not be read, so both commands work in a pipeline.
 
 > **PowerShell note:** `%20` and other `%xx` sequences in URLs are expanded by
 > PowerShell before reaching the tool. Double the percent signs (`%%20`) or put

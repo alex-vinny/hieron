@@ -6,8 +6,8 @@ Fetches actual unified patches (not full file contents), caches them in SQLite,
 and outputs analysis-ready JSON chunks.
 
 Usage:
-    python git_diff_analysis.py pr <url> [<url2> ...]  [--output json|summary|md|lines] [--chunk N] [--force]
-    python git_diff_analysis.py commit <commit-url> [<commit-url2> ...]  [--output json|summary|md|lines] [--chunk N] [--force]
+    python git_diff_analysis.py pr <url> [<url2> ...]  [--output json|summary|md|lines|stats] [--chunk N] [--force]
+    python git_diff_analysis.py commit <commit-url> [<commit-url2> ...]  [--output json|summary|md|lines|stats] [--chunk N] [--force]
     python git_diff_analysis.py tags <project> <repo> <oldTag> <newTag>
     python git_diff_analysis.py cache stats
     python git_diff_analysis.py cache clear [<url>]
@@ -160,6 +160,12 @@ def _api_request(url: str, pat: str, accept: str = "application/json",
     req = urllib.request.Request(url, headers=headers, data=data, method=method)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
+            # A rejected PAT is not a 401: Azure DevOps answers 203 with its HTML
+            # sign-in page, which would otherwise be read as the requested content.
+            if getattr(resp, "status", None) == 203:
+                raise RuntimeError(
+                    f"HTTP 203 sign-in page: Azure DevOps rejected the PAT "
+                    f"(expired, revoked or for another org): {url}")
             body_text = resp.read().decode("utf-8", errors="replace")
             if accept == "application/json":
                 return json.loads(body_text)
@@ -444,9 +450,24 @@ def compute_patch(file_path: str, old_content: Optional[str], new_content: Optio
     return "".join(diff)
 
 
+def _patch_body(patch: str):
+    """
+    The patch without its leading file header (`diff `, `---`, `+++`), the same rule
+    chunk_patch uses. Past the header, `---`/`+++` are content: an added `++i;`
+    reads `+++i;` and a removed `-- note` reads `--- note`.
+    """
+    in_header = True
+    for line in (patch or "").splitlines():
+        if in_header and line.startswith(("diff ", "---", "+++")):
+            continue
+        in_header = False
+        yield line
+
+
 def patch_stats(patch: str) -> dict:
-    added = sum(1 for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++"))
-    removed = sum(1 for l in patch.splitlines() if l.startswith("-") and not l.startswith("---"))
+    body = list(_patch_body(patch))
+    added = sum(1 for l in body if l.startswith("+"))
+    removed = sum(1 for l in body if l.startswith("-"))
     return {"added": added, "removed": removed}
 
 
@@ -691,9 +712,7 @@ def to_lines(results):
                         new_line = int(m.group(1))
                         continue
                     if new_line is None:
-                        continue
-                    if line.startswith("---") or line.startswith("+++"):
-                        continue
+                        continue  # file header, above the first hunk
                     if line.startswith("-"):
                         continue  # removed line — don't advance new_line
                     if line.startswith("+"):
@@ -702,6 +721,132 @@ def to_lines(results):
                     else:
                         new_line += 1  # context line
     return "\n".join(output)
+
+
+# Line-comment openers and block-comment delimiters by file extension. Only the
+# languages that actually appear in these repos — a general-purpose parser would be
+# wrong more often than this table is.
+_COMMENT_SYNTAX = {
+    "//": (".cs .js .jsx .ts .tsx .java .go .rs .c .h .cpp .hpp .scss .less .php "
+           ".kt .swift .dart .gradle"),
+    "#": ".py .sh .bash .ps1 .psm1 .yml .yaml .toml .rb .pl .r .tf .dockerfile .env .conf",
+    "--": ".sql .lua",
+    "%": ".tex .erl",
+    "'": ".vb .vbs",
+}
+_BLOCK_DELIMS = {
+    "c-style": ("/*", "*/", ".cs .js .jsx .ts .tsx .java .go .rs .c .h .cpp .hpp "
+                          ".css .scss .less .php .kt .swift .dart"),
+    "html": ("<!--", "-->", ".html .htm .xml .cshtml .razor .vue .svg .resx .csproj .config .props"),
+    "sql": ("/*", "*/", ".sql"),
+    "python": ('"""', '"""', ".py"),
+}
+
+
+def _comment_markers(path: str):
+    """(line_openers, block_pairs) for a path, by extension."""
+    ext = ("." + path.rsplit(".", 1)[-1].lower()) if "." in path else ""
+    line_openers = [op for op, exts in _COMMENT_SYNTAX.items() if ext in exts.split()]
+    blocks = [(o, c) for (o, c, exts) in _BLOCK_DELIMS.values() if ext in exts.split()]
+    return line_openers, blocks
+
+
+def classify_added_lines(path: str, patch: str) -> dict:
+    """
+    Split a patch's ADDED lines into code / comment / blank.
+
+    Why added-only: a review judges what is being introduced. Counting the whole
+    file measures the codebase's history instead of this change.
+
+    Block comments are tracked with a running flag so a multi-line /* ... */ is not
+    counted as code after its first line. A line that both closes a block and
+    carries trailing code counts as code — that is the honest reading.
+    """
+    line_openers, blocks = _comment_markers(path)
+    code = comment = blank = 0
+    in_block = None  # the closing delimiter we are waiting for
+    for raw in _patch_body(patch):
+        if not raw.startswith("+"):
+            continue
+        line = raw[1:].strip()
+        if in_block:
+            comment += 1
+            if in_block in line:
+                after = line.split(in_block, 1)[1].strip()
+                in_block = None
+                if after:
+                    comment -= 1
+                    code += 1
+            continue
+        if not line:
+            blank += 1
+            continue
+        # A block comment opening this line.
+        matched_block = False
+        for open_d, close_d in blocks:
+            if not line.startswith(open_d):
+                continue
+            matched_block = True
+            rest = line[len(open_d):]
+            if close_d in rest:
+                # Opens and closes here. Trailing code after the close makes it code.
+                after = rest.split(close_d, 1)[1].strip()
+                if after:
+                    code += 1
+                else:
+                    comment += 1
+            else:
+                comment += 1
+                in_block = close_d
+            break
+        if matched_block:
+            continue
+
+        if any(line.startswith(op) for op in line_openers):
+            comment += 1
+        else:
+            code += 1
+    return {"code": code, "comment": comment, "blank": blank}
+
+
+def to_stats(results) -> str:
+    """
+    Per-file added-line composition, plus a comment:code ratio.
+
+    This exists so "this change is 241 comment lines to 128 of code" is measured the
+    same way every time, rather than re-derived with an ad-hoc grep per review.
+    A ratio is evidence, not a verdict — read it next to what the code does.
+    """
+    rows = []
+    tot_code = tot_comment = tot_blank = 0
+    for r in results:
+        for f in r.get("files", []):
+            if f.get("skipped"):
+                continue
+            s = classify_added_lines(f["path"], f.get("patch") or "")
+            if not (s["code"] or s["comment"] or s["blank"]):
+                continue
+            rows.append((f["path"], s))
+            tot_code += s["code"]
+            tot_comment += s["comment"]
+            tot_blank += s["blank"]
+    if not rows:
+        return "No added lines."
+    width = max(len(p) for p, _ in rows)
+    width = min(max(width, 20), 70)
+    out = [f"{'FILE'.ljust(width)}  {'CODE':>6} {'COMMENT':>8} {'BLANK':>6}  RATIO"]
+    for path, s in sorted(rows, key=lambda x: -(x[1]["code"] + x[1]["comment"])):
+        shown = path if len(path) <= width else "…" + path[-(width - 1):]
+        ratio = (s["comment"] / s["code"]) if s["code"] else float("inf")
+        rtxt = "  —  " if s["comment"] == 0 else (f"{ratio:.2f}" if s["code"] else " all ")
+        out.append(f"{shown.ljust(width)}  {s['code']:>6} {s['comment']:>8} {s['blank']:>6}  {rtxt}")
+    total_ratio = (tot_comment / tot_code) if tot_code else float("inf")
+    out.append("-" * (width + 30))
+    out.append(f"{'TOTAL'.ljust(width)}  {tot_code:>6} {tot_comment:>8} {tot_blank:>6}  "
+               + (f"{total_ratio:.2f}" if tot_code else " all "))
+    out.append("")
+    out.append(f"Added lines: {tot_code} code, {tot_comment} comment, {tot_blank} blank.")
+    return "\n".join(out)
 
 
 def to_markdown(results):
@@ -852,7 +997,7 @@ Config: ~/.azure-connector.json (a JSON file with "pat"/"org"/"baseUrl")
 
     pr_parser = subparsers.add_parser("pr", help="Fetch and diff one or more PRs")
     pr_parser.add_argument("urls", nargs="+", help="Azure DevOps PR URL(s) or commit URL(s)")
-    pr_parser.add_argument("--output", choices=["json", "summary", "md", "lines"], default="json",
+    pr_parser.add_argument("--output", choices=["json", "summary", "md", "lines", "stats"], default="json",
                            help="Output format (default: json). 'lines' emits file:line for every added line.")
     pr_parser.add_argument("--chunk", type=int, default=300,
                            help="Max lines per JSON patch chunk (default: 300)")
@@ -863,7 +1008,7 @@ Config: ~/.azure-connector.json (a JSON file with "pat"/"org"/"baseUrl")
 
     commit_parser = subparsers.add_parser("commit", help="Fetch and diff one or more commits")
     commit_parser.add_argument("urls", nargs="+", help="Azure DevOps commit URL(s)")
-    commit_parser.add_argument("--output", choices=["json", "summary", "md", "lines"], default="json",
+    commit_parser.add_argument("--output", choices=["json", "summary", "md", "lines", "stats"], default="json",
                                help="Output format (default: json)")
     commit_parser.add_argument("--chunk", type=int, default=300,
                                help="Max lines per JSON patch chunk (default: 300)")
@@ -884,11 +1029,51 @@ Config: ~/.azure-connector.json (a JSON file with "pat"/"org"/"baseUrl")
     tags_parser.add_argument("old_tag", help="Old/base tag")
     tags_parser.add_argument("new_tag", help="New/target tag")
 
+    tw_parser = subparsers.add_parser(
+        "check-tailwind",
+        help="Are the arbitrary-value Tailwind classes added by a PR actually compiled?")
+    tw_parser.add_argument("urls", nargs="+", help="PR URL(s)")
+    tw_parser.add_argument("--css", help="Repo path of the COMPILED css, read at the PR's head commit")
+    tw_parser.add_argument("--css-local", dest="css_local",
+                           help="Read the css from this local file instead (CI-built, not committed)")
+    tw_parser.add_argument("--prefix", default="tw-", help="Utility class prefix (default: tw-)")
+    tw_parser.add_argument("--force", action="store_true", help="Bypass the diff cache")
+
+    resx_parser = subparsers.add_parser(
+        "check-resx",
+        help="Does every resource key a PR adds exist in all localized resx files?")
+    resx_parser.add_argument("urls", nargs="+", help="PR URL(s)")
+    resx_parser.add_argument("--root",
+                             help="Read the resx from this local clone instead of the PR's head "
+                                  "commit (warns when the clone is on another branch)")
+    resx_parser.add_argument("--resx", required=True,
+                             help="Repo path of the resx with {locale} as the placeholder, "
+                                  "e.g. src/App/Resources/Strings.{locale}.resx")
+    resx_parser.add_argument("--locales", default="pt-BR,en-US,es-ES", help="Comma-separated locales")
+    resx_parser.add_argument("--getter", default="Engine.Get",
+                             help="Resource accessor to scan for (default: Engine.Get)")
+    resx_parser.add_argument("--force", action="store_true", help="Bypass the diff cache")
+
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         sys.exit(0)
+
+    if args.command in ("check-tailwind", "check-resx"):
+        cfg = load_config()
+        if not cfg["pat"]:
+            print('ERROR: Azure PAT not configured. Set AZURE_PAT, or add "pat" to ~/.azure-connector.json',
+                  file=sys.stderr)
+            sys.exit(1)
+        db = get_db()
+        if args.command == "check-tailwind":
+            if bool(args.css) == bool(args.css_local):
+                print("ERROR: pass exactly one of --css <repo-path> (read at the PR head) or "
+                      "--css-local <file>.", file=sys.stderr)
+                sys.exit(2)
+            sys.exit(cmd_check_tailwind(args, cfg, db))
+        sys.exit(cmd_check_resx(args, cfg, db))
 
     if args.command == "cache":
         db = get_db()
@@ -985,11 +1170,267 @@ Config: ~/.azure-connector.json (a JSON file with "pat"/"org"/"baseUrl")
     emit_output(results, args)
 
 
+# ── Review checks over added lines ────────────────────────────────────────────
+#
+# Each check answers a question about the lines a change ADDS, using the same
+# reconstruction as --output lines, and compares them with a file read at the PR's
+# head commit.
+
+
+def added_lines(results):
+    """[(path, line_no, text)] for every added line across the fetched results."""
+    out = []
+    for r in results:
+        for f in r.get("files", []):
+            if f.get("skipped"):
+                continue
+            path = f["path"]
+            new_line = None
+            for line in (f.get("patch") or "").splitlines():
+                m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+                if m:
+                    new_line = int(m.group(1))
+                    continue
+                if new_line is None:
+                    continue  # file header, above the first hunk
+                if line.startswith("-"):
+                    continue
+                if line.startswith("+"):
+                    out.append((path, new_line, line[1:]))
+                new_line += 1
+    return out
+
+
+def extract_tailwind_classes(lines, prefix="tw-"):
+    """
+    Arbitrary-value utility classes (`tw-text-[10px]`) introduced by a change.
+
+    Only arbitrary-value classes are collected: a plain utility is either in the
+    safelist or in the content scan, while an arbitrary value is compiled only if
+    the scanner actually saw that exact string — which is the failure worth checking.
+    """
+    pat = re.compile(re.escape(prefix) + r"[a-z0-9-]*\[[^\]\s\"']+\]")
+    found = {}
+    for path, line_no, text in lines:
+        for cls in pat.findall(text):
+            found.setdefault(cls, []).append(f"{path}:{line_no}")
+    return found
+
+
+def tailwind_compiled(css: str, cls: str) -> bool:
+    """Is this class present as a compiled selector in the built CSS?
+
+    Tailwind escapes the brackets in the emitted selector (`.tw-text-\\[10px\\]`),
+    so a naive substring search for the raw class name misses every one of them.
+    Both forms are checked before concluding the class was not compiled.
+    """
+    escaped = cls.replace("[", r"\[").replace("]", r"\]")
+    return (escaped in css) or (cls in css)
+
+
+def cmd_check_tailwind(args, cfg, db):
+    results = _fetch_results(args, cfg, db)
+    lines = added_lines(results)
+    classes = extract_tailwind_classes(lines, args.prefix)
+    if not classes:
+        print(f"No arbitrary-value {args.prefix}* classes in the added lines.")
+        return 0
+
+    # Default: read the CSS at the PR's head commit, so the answer is about the same
+    # tree the added lines came from. --css-local is the escape hatch for a build
+    # artifact that is produced in CI and never committed.
+    if args.css_local:
+        try:
+            css = open(args.css_local, encoding="utf-8", errors="replace").read()
+        except OSError as e:
+            print(f"ERROR: cannot read --css-local {args.css_local}: {e}", file=sys.stderr)
+            return 2
+        source = f"{args.css_local} (local file — NOT the PR's tree)"
+    else:
+        try:
+            css = fetch_at_pr_head(cfg, results[0], args.css)
+        except RuntimeError as e:
+            print(f"ERROR: cannot read {args.css} at the PR's head commit: {e}", file=sys.stderr)
+            return 2
+        if css is None:
+            print(f"ERROR: {args.css} does not exist at the PR's head commit.", file=sys.stderr)
+            print("       Check the repo path, or pass --css-local if the CSS is built in CI "
+                  "and not committed.", file=sys.stderr)
+            return 2
+        head = ((results[0].get("pr") or {}).get("sourceCommit") or "")[:10]
+        source = f"{args.css} @ {head or (results[0].get('pr') or {}).get('sourceRef')}"
+    print(f"compiled CSS: {source} ({len(css):,} bytes)")
+    print(f"arbitrary-value classes added: {len(classes)}\n")
+    missing = []
+    for cls in sorted(classes):
+        ok = tailwind_compiled(css, cls)
+        if not ok:
+            missing.append(cls)
+        print(f"  {'OK     ' if ok else 'MISSING'}  {cls}")
+        if not ok:
+            for where in classes[cls][:3]:
+                print(f"             {where}")
+    print()
+    if missing:
+        print(f"{len(missing)} class(es) are NOT in the compiled CSS — they will render as nothing.")
+        if args.css_local:
+            print("You used --css-local: confirm that file is the build produced AFTER these lines,")
+            print("and from this PR's code. Otherwise this list means nothing.")
+        return 1
+    print("Every added arbitrary-value class is compiled.")
+    return 0
+
+
+def extract_resource_keys(lines, getter="Engine.Get"):
+    """Resource keys introduced by a change, e.g. Engine.Get("Greeting_Title")."""
+    pat = re.compile(re.escape(getter) + r"\(\s*\"([A-Za-z0-9_.]+)\"\s*\)")
+    found = {}
+    for path, line_no, text in lines:
+        for key in pat.findall(text):
+            found.setdefault(key, []).append(f"{path}:{line_no}")
+    return found
+
+
+def resx_has_key(resx_text: str, key: str) -> bool:
+    return re.search(r'name\s*=\s*"' + re.escape(key) + r'"', resx_text) is not None
+
+
+def cmd_check_resx(args, cfg, db):
+    results = _fetch_results(args, cfg, db)
+    keys = extract_resource_keys(added_lines(results), args.getter)
+    if not keys:
+        print(f"No new {args.getter}(...) keys in the added lines.")
+        return 0
+    locales = [l.strip() for l in args.locales.split(",") if l.strip()]
+    pr = results[0].get("pr") or {}
+    pr_branch = pr.get("sourceRef")
+    head = (pr.get("sourceCommit") or "")[:10]
+
+    print(f"new keys: {len(keys)}    locales: {', '.join(locales)}")
+    if args.root:
+        # Opt-in local mode. A key "missing" from a clone that is not at the PR's
+        # head means nothing, so say so before the findings rather than leaving the
+        # reader to reach a wrong conclusion.
+        clone_branch = _git_branch(args.root)
+        print(f"reading:  {args.root}  @ {clone_branch or '(unknown)'}   [LOCAL TREE]")
+        if pr_branch:
+            print(f"PR head:  {pr_branch}")
+        if pr_branch and clone_branch and pr_branch != clone_branch:
+            print()
+            print("  ⚠  THE CLONE IS NOT ON THE PR'S BRANCH. Any key reported missing below is")
+            print("     probably just absent from the checked-out tree, not from the change.")
+            print("     Drop --root to read the resx at the PR's head commit instead.")
+    else:
+        print(f"reading:  {pr.get('repo')} @ {head or pr_branch}   [PR HEAD]")
+    print()
+
+    failed = False
+    for locale in locales:
+        rel = args.resx.replace("{locale}", locale)
+        if args.root:
+            path = os.path.join(args.root, rel)
+            try:
+                text = open(path, encoding="utf-8", errors="replace").read()
+            except OSError as e:
+                print(f"  {locale:<8} ERROR reading {path}: {e}")
+                failed = True
+                continue
+        else:
+            try:
+                text = fetch_at_pr_head(cfg, results[0], rel)
+            except RuntimeError as e:
+                print(f"ERROR: cannot read {rel} at the PR's head commit: {e}", file=sys.stderr)
+                return 2
+            if text is None:
+                print(f"  {locale:<8} ERROR: {rel} does not exist at the PR's head commit")
+                failed = True
+                continue
+        missing = [k for k in sorted(keys) if not resx_has_key(text, k)]
+        if missing:
+            failed = True
+            print(f"  {locale:<8} MISSING {len(missing)}: {', '.join(missing)}")
+            for k in missing[:5]:
+                print(f"           {k}  <- {keys[k][0]}")
+        else:
+            print(f"  {locale:<8} all {len(keys)} present")
+    return 1 if failed else 0
+
+
+def fetch_at_pr_head(cfg, result, file_path):
+    """
+    A file's content as it exists at the PR's head commit.
+
+    Reading the same file from a local clone answers a question about whichever
+    branch happens to be checked out, so a key or class the PR does add can come
+    back "missing". Pinned to the COMMIT, not the branch name, so a branch that
+    moves mid-review cannot change the answer.
+
+    Returns None only when the file does not exist at that commit (HTTP 404). Any
+    other failure (auth, network, missing coordinates) raises RuntimeError: it is
+    not evidence that the file is absent.
+    """
+    pr = (result or {}).get("pr") or {}
+    commit = pr.get("sourceCommit")
+    branch = pr.get("sourceRef")
+    org, project, repo = pr.get("org"), pr.get("project"), pr.get("repo")
+    if not (org and project and repo):
+        raise RuntimeError("the PR result carries no org/project/repo to read the file from")
+    try:
+        return api_get_file_content(
+            cfg, org, project, repo, file_path,
+            commit_id=commit, branch=(None if commit else branch),
+        )
+    except RuntimeError as e:
+        if str(e).startswith("HTTP 404"):
+            return None
+        raise
+    except OSError as e:  # URLError, timeout, connection reset
+        raise RuntimeError(str(e)) from e
+
+
+def _git_branch(root):
+    """Current branch of a clone, or None when it isn't a git working tree."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return out.stdout.strip() or None if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _fetch_results(args, cfg, db):
+    """Fetch the PR(s) named on the command line — shared by the check commands."""
+    results = []
+    for raw_url in args.urls:
+        parsed = parse_pr_url(raw_url)
+        if not parsed:
+            print(f"ERROR: Cannot parse PR URL: {raw_url}", file=sys.stderr)
+            sys.exit(1)
+        result = fetch_pr(
+            cfg, db,
+            org=parsed["org"], project=parsed["project"],
+            repo=parsed["repo"], pr_id=parsed["pr_id"],
+            pr_url=raw_url, force=getattr(args, "force", False),
+        )
+        # The repo coordinates are attached here rather than inside pr_meta, which
+        # is cached: an older cache entry may not carry them.
+        result.setdefault("pr", {}).update({
+            "org": parsed["org"], "project": parsed["project"], "repo": parsed["repo"],
+        })
+        results.append(result)
+    return results
+
+
 def emit_output(results, args):
     if args.output == "summary":
         print_summary(results)
     elif args.output == "md":
         print(to_markdown(results))
+    elif args.output == "stats":
+        print(to_stats(results))
     elif args.output == "lines":
         json_results = to_analysis_json(results, args.chunk)
         print(to_lines(json_results))
