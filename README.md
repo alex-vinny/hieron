@@ -15,7 +15,10 @@ to hand to a model within its context window.
 
 ## Requirements
 
-- **Python 3.8+** (standard library only — no third-party packages)
+- **Python 3.8+** (standard library only — no third-party packages). On a machine where a legacy Python 2
+  comes first on `PATH`, bare `python` fails with `SyntaxError: Non-ASCII character '\xe2'`: run it through the
+  `git-diff-analysis.cmd` shim (it calls `py -3`) or `py -3 git_diff_analysis.py`. The `python` in the examples
+  below means a Python 3 interpreter.
 - An Azure DevOps **PAT**, read from `~/.azure-connector.json` or the `AZURE_PAT`
   environment variable.
 
