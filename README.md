@@ -43,7 +43,52 @@ live branch tips. So it:
 - produces right-side line numbers that match what Azure DevOps anchors inline
   comments against (so `--output lines` numbers line up with an inline-comment tool).
 
-Re-run with `--force` after the author pushes a new iteration.
+The iteration list is read on every run (one call), and everything else is cached under the
+**commit pair**. A new push is a new iteration with a new source commit, so the cache can never
+serve a stale diff and `--force` is only needed to rule the cache out.
+
+## Two backends: the REST API (default) or a local clone (`--repo`)
+
+| | REST API (default) | `--repo <clone>` |
+|---|---|---|
+| How | downloads both versions of each changed file (6 in parallel), diffs in Python | `git diff` between the two commits |
+| Speed | one request per file side | one `git` call; missing commits are fetched by SHA |
+| Algorithm | `difflib` with autojunk off + git-style slider placement | git `histogram`, indent heuristic |
+| Hunk headers | `@@ -a,b +c,d @@` | `@@ -a,b +c,d @@ public void Method()` (built-in funcname drivers for C#, Java, Python, Go, …; the repo's own `.gitattributes` wins) |
+| `--function-context` | no | yes (whole enclosing function) |
+| Binaries | NUL-sniffed: size + short sha256 (+ image dimensions) | the same, also for `.png`/`.dll`/… that the REST backend skips |
+
+`--repo` reads git objects only: it never checks out, never moves a branch and never touches the
+working tree, so it is safe on a clone with uncommitted work. Both backends give the same
+`file:line` anchors in practice; where a block can be aligned two valid ways they may differ by a
+few lines (checked on real PRs: 2 of 3 identical, the third 7 lines of 545 placed differently).
+
+## What the diff reports
+
+- **Renames** are one entry with `oldPath` (Azure sends the old path in `sourceServerItem` and a
+  separate `delete, sourceRename` entry, which is dropped). Before, a renamed file showed up as a
+  full addition plus a full deletion.
+- **A file without a final newline** gets git's `\ No newline at end of file` marker; lines are
+  split on `\n` only, so `\x0c` or `\u2028` inside a line never shifts the numbering.
+- **Whitespace-only** changes are flagged (`whitespaceOnly: true`), never hidden: a whitespace
+  change inside a string literal is still a change.
+- **Binary files** (a NUL in the first 8000 bytes; UTF-16 with a BOM is read as text) carry
+  `binary: {old, new}` with size, short sha256 and, for PNG/GIF/JPEG, dimensions.
+- **Submodules** show as `Subproject commit <sha>` lines, as in `git diff`.
+- **Skipped files** are listed with a reason (`binary-extension`, `generated`, `excluded`).
+  `--include '*.resx'` brings back a file the defaults skip; `--exclude 'Migrations/*'` adds one.
+- **Any read failure is an error** (exit 2, message on stderr even when stdout is redirected).
+  A file that could not be downloaded used to come out as fully added, and was cached that way.
+- Change lists are paged until Azure marks the last page (`allChangesIncluded`): big PRs and tag
+  comparisons are no longer cut at 500/1000 entries.
+
+## Second review round: `--since-iteration N`
+
+`pr <url> --since-iteration 2` diffs iteration 2's source commit against the latest one: what the
+author changed since you last looked. Line numbers are still the latest iteration's, so anchors stay
+valid. If the author merged the target branch in between, the merge base moved and the diff also
+carries everything that came from the target; the tool says so (`targetMergedSince: true` and a
+warning).
 
 ## Commands
 
@@ -55,6 +100,7 @@ Re-run with `--force` after the author pushes a new iteration.
 | `tags <repo-url> <oldTag> <newTag>` | same, project/repo taken from the URL |
 | `cache stats` | show cache size and age |
 | `cache clear [<url>]` | clear the whole cache, or one PR/commit |
+| `cache prune [--days 30]` | drop rows older than N days and compact the file |
 | `check-tailwind <pr-url> --css <repo-path> \| --css-local <file> [--prefix tw-]` | are the arbitrary-value Tailwind classes the PR adds actually compiled? |
 | `check-resx <pr-url> --resx "<repo path with {locale}>" [--root <clone>] [--locales a,b,c] [--getter Engine.Get]` | does every resource key the PR adds exist in all localized `.resx` files? |
 
@@ -64,8 +110,14 @@ Shared flags for `pr` / `commit`:
 |---|---|
 | `--output json\|summary\|md\|lines\|stats` | output format (default `json`) |
 | `--chunk N` | max lines per JSON patch chunk (default 300) |
-| `--force` | bypass the 30-minute cache and re-fetch |
-| `--quiet`, `-q` | suppress progress on stderr (also auto-off when stdout is redirected) |
+| `--force` | bypass the cache and re-fetch |
+| `--quiet`, `-q` | suppress progress on stderr (also auto-off when stdout is redirected); errors still show |
+| `--repo <clone>` | diff in a local clone with git instead of the REST API |
+| `--context N`, `-U N` | context lines per hunk (default 5) |
+| `--function-context` | with `--repo`: the whole enclosing function around each change |
+| `--include GLOB`, `--exclude GLOB` | repeatable; match the full path or the file name |
+| `--workers N` | parallel downloads through the API (default 6) |
+| `--since-iteration N` | `pr` only: diff iteration N against the latest (see above) |
 
 `--output lines` emits `file:line  content` for every added line, reconstructing
 new-file line numbers from the hunk headers — useful for pinpointing exact
@@ -117,8 +169,7 @@ something is missing and 2 when a file could not be read, so both commands work 
 
 > **PowerShell note:** `%20` and other `%xx` sequences in URLs are expanded by
 > PowerShell before reaching the tool. Double the percent signs (`%%20`) or put
-> the command in a `.bat` file. If the tool exits silently with code 1 and no
-> output, the URL was likely mangled.
+> the command in a `.bat` file. A mangled URL ends with `ERROR: Cannot parse PR URL`.
 
 ## Examples
 
@@ -199,19 +250,24 @@ intact, so it can be fed to a model independently. `commit` output uses a
 
 ## Cache
 
-Results are cached in `~/.git-diff-analysis.db` (SQLite) for 30 minutes, so
-repeated analyses of the same PR or commit don't re-download the repo.
+Results are cached in `~/.git-diff-analysis.db` (SQLite), keyed by the commit pair a diff
+compares, so they never go stale and need no expiry. Only patches and file metadata are stored,
+not full file contents (an older cache that kept them reached ~180 MB; `cache prune` drops old
+rows and those contents, then compacts the file). The `--repo` backend is not cached: local git
+is already fast.
 
 ## Tests
 
-Pure-function unit tests (stdlib `unittest`, no network):
+Unit tests (stdlib `unittest`, no network; the `--repo` tests build a throwaway git repository
+and are skipped when `git` is not on `PATH`):
 
 ```bash
 python -m unittest test_git_diff_analysis -v
 ```
 
-Covers `patch_stats`, `compute_patch`, `to_lines` (line-number reconstruction),
-and `chunk_patch`.
+Covers patch building (final-newline marker, slider placement, autojunk), line-number
+reconstruction, rename/paging normalization of the Azure response, binary detection, git output
+parsing, both backends end to end (network replaced by fakes) and the review checks.
 
 ## License
 
